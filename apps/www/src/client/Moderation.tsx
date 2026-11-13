@@ -1,0 +1,2169 @@
+import { useCallback, useEffect, useState } from 'react'
+import Markdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+
+import { PlatformType } from '@repo/domain/src/enums'
+
+import { KickReportCategory } from '../../../notify/src/notification-payloads'
+import { accountIdForUsername, call, isAdmin, useAction, usernamesFor, where } from './api'
+
+import type { ReactNode } from 'react'
+import type { ReportKind } from '../../../api/src/reports-db'
+import type { PublicAccount } from './api'
+
+/**
+ * The staff moderation panel, at `/moderation`.
+ *
+ * Its own file rather than another section of App.tsx: App renders this, so the shared
+ * plumbing both need lives in api.ts (see the note there), and this is a whole surface
+ * rather than one more form on the account dashboard.
+ *
+ * Everything here talks to `www`'s own `/api/staff/*` endpoints (see src/staff.ts) —
+ * except the names, which come from `accounts`' bulk lookup, the same endpoint the game
+ * uses. The staff reads return account IDS; a moderation table whose rows are numbers is
+ * unreadable, and joining names on the server would tie those reads to a table another
+ * worker owns.
+ *
+ * The `isAdmin()` gate below is cosmetic. It decodes the token's `role` claim without
+ * verifying it, because a page holds no signing key — faking it reveals a table that
+ * every endpoint behind it answers 403 to. `requireStaff` is the real gate.
+ */
+
+/** What the panel is showing. The player history is a drill-down from any of them. */
+type Tab = 'queue' | 'search' | 'bans' | 'new'
+
+const TABS: Array<{ id: Tab; label: string }> = [
+	// Queue first: "who is a problem right now" is the question someone opens this page
+	// with, where the search is what you use once you know who you're looking at.
+	{ id: 'queue', label: 'Report queue' },
+	{ id: 'search', label: 'Search reports' },
+	{ id: 'bans', label: 'Standing bans' },
+	{ id: 'new', label: 'File a report' },
+]
+
+const TAB_IDS = new Set<string>(TABS.map((t) => t.id))
+
+/**
+ * Which view a `/moderation/…` path names.
+ *
+ * Every one of these is a REAL URL rather than a piece of component state, so the back
+ * button walks back out of a drill-down instead of leaving the panel — which is what it
+ * did when the tab and the open player were held in `useState`: a moderator two clicks
+ * deep pressed Back and landed on the homepage, losing the whole session. Along the way it
+ * makes each view linkable, which is how one moderator hands another a player to look at.
+ *
+ * `/moderation` alone is the queue, so the nav link needs no tab in it and a bookmark of
+ * the bare path still opens on something.
+ */
+type View =
+	| { kind: 'tab'; tab: Tab }
+	| { kind: 'player'; playerId: number }
+	| { kind: 'ban'; reportId: number }
+	| { kind: 'report'; reportId: number }
+
+function viewForPath(path: string): View {
+	const rest = path.replace(/^\/moderation\/?/, '').replace(/\/$/, '')
+	if (rest === '') return { kind: 'tab', tab: 'queue' }
+
+	const player = /^players\/(\d+)$/.exec(rest)
+	if (player) return { kind: 'player', playerId: Number.parseInt(player[1]!, 10) }
+
+	const ban = /^reports\/(\d+)\/ban$/.exec(rest)
+	if (ban) return { kind: 'ban', reportId: Number.parseInt(ban[1]!, 10) }
+
+	const report = /^reports\/(\d+)$/.exec(rest)
+	if (report) return { kind: 'report', reportId: Number.parseInt(report[1]!, 10) }
+
+	// An unknown segment falls back to the queue rather than rendering nothing: these paths
+	// are typed and pasted, and a typo should land somewhere usable.
+	return { kind: 'tab', tab: TAB_IDS.has(rest) ? (rest as Tab) : 'queue' }
+}
+
+/** Where a tab lives. The queue is the bare path, not `/moderation/queue`. */
+const tabPath = (tab: Tab): string => (tab === 'queue' ? '/moderation' : `/moderation/${tab}`)
+
+/**
+ * A stored report, as `www` serves the row — snake_case, because it IS the row. Not every
+ * column is rendered; the ones that are not (the measured heights, the instance type) are
+ * kept in the type so a row can be passed around whole.
+ */
+interface ReportRow {
+	id: number
+	reporter_player_id: number
+	reported_player_id: number
+	report_category: number
+	details: string | null
+	room_id: number | null
+	room_instance_type: string | null
+	created_at: string
+	banned: number
+	ban_expires: string | null
+	event_id: number | null
+	invention_id: number | null
+	custom_avatar_item_id: string | null
+	banned_by_player_id: number | null
+	banned_at: string | null
+	chat_message_id: number | null
+	image_id: number | null
+	/**
+	 * The reported photo's key on `img`, joined on by `www` (the `report` table stores only
+	 * the id). Null for a report that isn't against a photo, or one whose photo is gone.
+	 */
+	image_name?: string | null
+	/**
+	 * Whether `details` is markdown — true only for a report the AI moderation bot filed
+	 * (`AI_MODERATION_ID`, decided by `www`). Served on the single-report read alone.
+	 */
+	details_markdown?: boolean
+	/**
+	 * Who lifted the ban that once stood on this row, and when — null until one is lifted,
+	 * and cleared again by a re-ban. A lift wipes the four ban columns, so this pair is the
+	 * only thing on the row that says a colleague decided this player belongs back in the
+	 * game; without it the row reads as untouched and the next moderator bans them again.
+	 */
+	unbanned_by_player_id: number | null
+	unbanned_at: string | null
+}
+
+/** A moderator-issued warning, as the `warning` table stores it. */
+interface WarningRow {
+	id: number
+	moderator_player_id: number
+	warned_player_id: number
+	report_category: number
+	display_reason: string | null
+	moderator_note: string | null
+	created_at: string
+}
+
+/** A row of the report queue — see `getTopReported`. */
+interface ReportedPlayerTally {
+	playerId: number
+	reports: number
+	distinctReporters: number
+	lastReportAt: string
+	bannedNow: boolean
+}
+
+/** An account a ban would also reach, and what links it — see `linkedAccountsHandler`. */
+interface LinkedAccount {
+	accountId: number
+	username: string | null
+	/** Which arm(s) matched — both when the account shares a login AND an address. */
+	via: Array<'platform' | 'ip'>
+	/** Every platform identity on the account, not only the shared one. */
+	platforms: Array<{ platform: number; platformId: string }>
+	signupIp: string | null
+	lastLoginIp: string | null
+	/** Every address the account has been seen from, most recent first. */
+	ips: Array<{ ip: string; firstSeen: string; lastSeen: string; hits: number }>
+}
+
+/**
+ * A `PlatformType` as a moderator reads it. Walks the enum rather than keeping a second
+ * table, so a platform added there shows up here by name; a number the enum doesn't know
+ * is shown as itself rather than hidden.
+ */
+function platformName(platform: number): string {
+	const entry = Object.entries(PlatformType).find(([, value]) => value === platform)
+	return entry ? entry[0] : `platform ${platform}`
+}
+
+/**
+ * What a report's category means, keyed off the client's own enum so a renumbering moves
+ * these labels with it rather than leaving them quietly wrong.
+ *
+ * The names are the client's, made readable: `CoCSexual` is the code of conduct's sexual
+ * content rule, and a moderator reading a table should not have to know that. An id with
+ * no entry is shown as the bare number — the column is stored verbatim and unmapped (see
+ * the report write), so a build that reports something new must not render a blank.
+ */
+const CATEGORY_LABEL: Record<number, string> = {
+	[KickReportCategory.Moderator]: 'Moderator action',
+	[KickReportCategory.Unknown]: 'Unspecified',
+	[KickReportCategory.Harassment]: 'Harassment',
+	[KickReportCategory.Cheating]: 'Cheating',
+	[KickReportCategory.AFK]: 'Inactive (AFK)',
+	[KickReportCategory.Misc]: 'Game conduct',
+	[KickReportCategory.Underage]: 'Underage',
+	[KickReportCategory.VoteKick]: 'Vote to kick',
+	[KickReportCategory.MisleadingPurchases]: 'Misleading purchases',
+	[KickReportCategory.CoCUnderage]: 'Underage (CoC)',
+	[KickReportCategory.CoCSexual]: 'Sexual content',
+	[KickReportCategory.CoCDiscrimination]: 'Discrimination',
+	[KickReportCategory.CoCTrolling]: 'Griefing / trolling',
+	[KickReportCategory.CoCNameOrProfile]: 'Name or profile',
+	[KickReportCategory.InappropriateClothing]: 'Inappropriate clothing',
+	[KickReportCategory.IssuingInaccurateReports]: 'Inaccurate reports',
+}
+
+/** The categories the file-a-report form offers, in the order it lists them. */
+const FILEABLE_CATEGORIES = [
+	KickReportCategory.CoCDiscrimination,
+	KickReportCategory.CoCSexual,
+	KickReportCategory.CoCTrolling,
+	KickReportCategory.Harassment,
+	KickReportCategory.CoCNameOrProfile,
+	KickReportCategory.CoCUnderage,
+	KickReportCategory.Cheating,
+	KickReportCategory.InappropriateClothing,
+	KickReportCategory.IssuingInaccurateReports,
+	KickReportCategory.Misc,
+]
+
+const categoryLabel = (id: number): string => CATEGORY_LABEL[id] ?? `Category ${id}`
+
+/** How many reports one page of search results holds. */
+const PAGE_SIZE = 25
+
+/**
+ * A date as a moderator reads it — ISO 8601 in UTC, to the minute (`2026-09-25T13:04Z`).
+ * Not local time: the moderators are in different countries, and a ban that expires
+ * "01:04 PM" means a different instant to each of them and a different date on either
+ * side of midnight. One unambiguous spelling, the same on every screen.
+ */
+function when(iso: string | null): string {
+	if (iso === null) return '—'
+	const parsed = Date.parse(iso)
+	if (Number.isNaN(parsed)) return iso
+	return new Date(parsed).toISOString().slice(0, 16) + 'Z'
+}
+
+/** Just the UTC date (`2026-09-25`) — for tables, where the full time is on the view page. */
+function day(iso: string | null): string {
+	if (iso === null) return '—'
+	const parsed = Date.parse(iso)
+	if (Number.isNaN(parsed)) return iso
+	return new Date(parsed).toISOString().slice(0, 10)
+}
+
+/**
+ * What a ban's expiry says on screen. A null expiry is permanent, not missing — the two
+ * read identically as an empty cell, and confusing them is the difference between a
+ * week's ban and a life one.
+ */
+const expiryLabel = (report: ReportRow): string =>
+	report.banned !== 1 ? '—' : report.ban_expires === null ? 'Permanent' : when(report.ban_expires)
+
+/**
+ * A report whose ban a moderator LIFTED — as opposed to one nobody acted on, which the row
+ * otherwise looks identical to. A standing ban is never "lifted": a re-ban clears the pair.
+ */
+const banLifted = (report: ReportRow): boolean => report.banned !== 1 && report.unbanned_at !== null
+
+/**
+ * "(lifted) by X" — shown wherever a lifted ban would otherwise pass for a clean report.
+ * It is what stops a second moderator undoing the first one's decision without knowing
+ * there was one: the row says who let the player back in, so the question goes to them
+ * rather than straight back to the ban button. Just the who — when it was lifted is on
+ * the row (`unbanned_at`) but not worth the width in a table cell.
+ */
+function LiftedBan({
+	report,
+	names,
+	navigate,
+}: {
+	report: ReportRow
+	names: Map<number, PublicAccount>
+	navigate?: (to: string) => void
+}) {
+	return (
+		<>
+			<span className="badge mod-lifted">lifted</span>{' '}
+			<span className="muted">
+				by{' '}
+				{report.unbanned_by_player_id === null ? (
+					'staff'
+				) : (
+					<PlayerName id={report.unbanned_by_player_id} names={names} navigate={navigate} />
+				)}
+			</span>
+		</>
+	)
+}
+
+/**
+ * What kind of thing a report is against. The five id columns are mutually exclusive and
+ * a row with none of them is an ordinary player report (see reports-db) — which is the
+ * only way to tell the kinds apart, so it is worth a column of its own.
+ */
+function reportKind(report: ReportRow): string {
+	if (report.event_id !== null) return KIND_LABEL.event
+	if (report.invention_id !== null) return KIND_LABEL.invention
+	if (report.custom_avatar_item_id !== null) return KIND_LABEL.avatarItem
+	if (report.chat_message_id !== null) return KIND_LABEL.chat
+	if (report.image_id != null) return KIND_LABEL.photo
+	return KIND_LABEL.player
+}
+
+/**
+ * Each kind's label, keyed by the `kind` the search filters on (`REPORT_KINDS` in
+ * reports-db) — the Kind column and the Kind filter read from this one table.
+ */
+const KIND_LABEL: Record<ReportKind, string> = {
+	player: 'Player',
+	event: 'Event',
+	invention: 'Invention',
+	avatarItem: 'Avatar item',
+	chat: 'Chat message',
+	photo: 'Photo',
+}
+
+/**
+ * Where to see the thing a report is against, or null when there's nothing to open (a
+ * player or chat report, or a photo that's gone). Inventions and avatar items open their
+ * public store pages, which show only PUBLISHED ones — an unpublished invention reads as
+ * "no invention here", and the id in the title is still there to look it up by.
+ */
+function reportTarget(report: ReportRow): { href: string; title: string } | null {
+	if (report.image_name && report.image_id != null) {
+		// The photo's own page rather than the bare file, so staff can delete it from there.
+		return { href: `/image/${report.image_id}`, title: `Photo #${report.image_id}` }
+	}
+	if (report.invention_id !== null) {
+		return {
+			href: `/d/store/invention/${report.invention_id}`,
+			title: `Invention #${report.invention_id}`,
+		}
+	}
+	if (report.custom_avatar_item_id !== null) {
+		return {
+			href: `/d/store/customavataritem/${report.custom_avatar_item_id}`,
+			title: `Avatar item ${report.custom_avatar_item_id}`,
+		}
+	}
+	return null
+}
+
+/** A report's kind, linked to the reported thing when there's one to open. */
+function ReportKind({ report }: { report: ReportRow }) {
+	const target = reportTarget(report)
+	if (!target) return <>{reportKind(report)}</>
+	return (
+		<a href={target.href} target="_blank" rel="noreferrer" title={target.title}>
+			{reportKind(report)}
+		</a>
+	)
+}
+
+/**
+ * A `@name` that opens the player's public profile (`/user/<username>`), routed in-app the
+ * way `App`'s `Link` does. Only the username can address a profile, so a caller with
+ * nothing but an id has nothing to link to.
+ */
+function ProfileLink({
+	username,
+	navigate,
+	children,
+}: {
+	username: string
+	navigate: (to: string) => void
+	children: ReactNode
+}) {
+	const to = `/user/${encodeURIComponent(username)}`
+	return (
+		<a
+			href={to}
+			onClick={(e) => {
+				e.preventDefault()
+				navigate(to)
+			}}
+		>
+			{children}
+		</a>
+	)
+}
+
+/**
+ * A player as `@name`. The id is in the title, not on screen: it costs width in every
+ * cell of every table and staff can look it up when they need it. It IS shown while the
+ * name is still loading or for an account with none, so a row is never nameless.
+ *
+ * Given `navigate`, the name links to the player's profile. Callers that render the name
+ * inside a `linkish` button (which opens the player's moderation page) leave it off: an
+ * anchor inside a button is invalid, and the button already goes somewhere.
+ */
+function PlayerName({
+	id,
+	names,
+	navigate,
+}: {
+	id: number
+	names: Map<number, PublicAccount>
+	navigate?: (to: string) => void
+}) {
+	const account = names.get(id)
+	const name = account?.username ? `@${account.username}` : <span className="muted">#{id}</span>
+	return (
+		<span className="mod-player" title={`#${id}`}>
+			{navigate && account?.username ? (
+				<ProfileLink username={account.username} navigate={navigate}>
+					{name}
+				</ProfileLink>
+			) : (
+				name
+			)}
+		</span>
+	)
+}
+
+/**
+ * The read of a staff endpoint, with the loading and failure states the panel renders.
+ * `data === null` with no error means still in flight.
+ *
+ * A `null` path means "nothing to read yet" and holds whatever was last loaded — the
+ * search uses it so the table doesn't clear itself between submissions. Re-reads when the
+ * path changes (it carries the query string, so that covers every filter change) or when
+ * a caller's dep does: the panel passes a revision counter it bumps after any write, so
+ * banning someone refreshes whichever tables are on screen.
+ */
+function useStaffData<T>(path: string | null, deps: unknown[] = []) {
+	const [data, setData] = useState<T | null>(null)
+	const [error, setError] = useState('')
+
+	useEffect(() => {
+		if (path === null) return
+		// Guards against the response of a superseded read landing after a newer one — two
+		// filter changes in quick succession would otherwise render whichever finished last.
+		let live = true
+		setError('')
+		call<T>(path, { authed: true })
+			.then((result) => live && setData(result))
+			.catch((err: unknown) => live && setError(err instanceof Error ? err.message : String(err)))
+		return () => {
+			live = false
+		}
+		// The caller's deps are spread in deliberately — the lint rule can't see through a
+		// variable-length array, and `path` plus those deps is the whole trigger set.
+		// oxlint-disable-next-line react-hooks/exhaustive-deps
+	}, [path, ...deps])
+
+	return { data, error }
+}
+
+/** A ban that blocks a player, and which arm of `resolveBan` it reached them by. */
+interface BanMatch {
+	ban: ReportRow
+	via: 'account' | 'platform' | 'ip'
+	bannedAccountId: number
+}
+
+/** What a linked arm rests on, in a moderator's words. */
+const VIA_LABEL: Record<BanMatch['via'], string> = {
+	account: 'their own account',
+	platform: 'a shared platform identity',
+	ip: 'a shared IP address',
+}
+
+/** The player-history endpoint's reply. */
+interface PlayerHistoryData {
+	playerId: number
+	reports: ReportRow[]
+	warnings: WarningRow[]
+	activeBan: ReportRow | null
+	blockedBy: BanMatch | null
+}
+
+/** A ban's report number, linked to the report's page in the panel. */
+function ReportLink({ report, navigate }: { report: ReportRow; navigate: (to: string) => void }) {
+	return (
+		<button
+			type="button"
+			className="linkish"
+			onClick={() => navigate(`/moderation/reports/${report.id}/ban`)}
+		>
+			report #{report.id}
+		</button>
+	)
+}
+
+/**
+ * The ban standing on a player, if any: their own, or — when their own account is clean —
+ * a linked account's that `auth`/`match` still lock them out with. Null when nothing blocks
+ * them. Shared by the profile line and the history page so the two can't disagree.
+ */
+function BanSummary({
+	data,
+	names,
+	navigate,
+}: {
+	data: PlayerHistoryData
+	names: Map<number, PublicAccount>
+	navigate: (to: string) => void
+}) {
+	const ban = data.activeBan ?? data.blockedBy?.ban ?? null
+	if (ban === null) return null
+	const expiry = ban.ban_expires === null ? 'permanently' : `until ${when(ban.ban_expires)}`
+	if (data.activeBan !== null) {
+		return (
+			<>
+				Banned on <ReportLink report={ban} navigate={navigate} /> for{' '}
+				{categoryLabel(ban.report_category)} — {expiry}.
+			</>
+		)
+	}
+	const match = data.blockedBy!
+	return (
+		<>
+			Blocked by the ban on{' '}
+			<PlayerName id={match.bannedAccountId} names={names} navigate={navigate} /> (
+			<ReportLink report={ban} navigate={navigate} />, {categoryLabel(ban.report_category)} —{' '}
+			{expiry}), through {VIA_LABEL[match.via]}.
+		</>
+	)
+}
+
+/**
+ * One line for a player's profile page (`/user/<username>`): whether a ban blocks them right
+ * now — their own or a linked account's — and a link to their full history here.
+ */
+export function PlayerBanStatus({
+	playerId,
+	navigate,
+}: {
+	playerId: number
+	navigate: (to: string) => void
+}) {
+	const { data, error } = useStaffData<PlayerHistoryData>(`/api/staff/players/${playerId}`)
+	const names = useNames(data?.blockedBy ? [data.blockedBy.bannedAccountId] : [])
+	const history = (
+		<button
+			type="button"
+			className="linkish accent"
+			onClick={() => navigate(`/moderation/players/${playerId}`)}
+		>
+			Moderation history →
+		</button>
+	)
+
+	if (error) return <p className="error">{error}</p>
+	if (data === null) return <p className="muted">Checking for a ban…</p>
+	return data.activeBan === null && data.blockedBy === null ? (
+		<p className="muted">Not banned. {history}</p>
+	) : (
+		<p className="error">
+			<BanSummary data={data} names={names} navigate={navigate} /> {history}
+		</p>
+	)
+}
+
+/**
+ * Names for every id a page of rows mentions, in one bulk lookup.
+ *
+ * Re-runs when the rows change, and holds the previous names while the next lookup is in
+ * flight, so a table doesn't flash back to bare ids between pages.
+ */
+function useNames(ids: number[]) {
+	const [names, setNames] = useState<Map<number, PublicAccount>>(new Map())
+	const key = ids.join(',')
+
+	useEffect(() => {
+		if (key === '') return
+		let live = true
+		void usernamesFor(key.split(',').map(Number)).then((found) => {
+			// Merged rather than replaced: the panel holds several tables, and a lookup for
+			// one must not blank the names in another.
+			if (live) setNames((prev) => new Map([...prev, ...found]))
+		})
+		return () => {
+			live = false
+		}
+	}, [key])
+
+	return names
+}
+
+export function ModerationPage({
+	account,
+	path,
+	search,
+	navigate,
+}: {
+	account: { accountId: number; username: string } | null | undefined
+	/** The full pathname — the panel routes under `/moderation`; see {@link viewForPath}. */
+	path: string
+	/** The query string, where the search tab keeps its filters and its page. */
+	search: string
+	navigate: (to: string) => void
+}) {
+	const view = viewForPath(path)
+	// Bumped after a write that leaves you where you are — lifting a ban from a table. A
+	// write that NAVIGATES (banning, filing a report) needs no bump: the view it lands on
+	// mounts fresh and reads for itself.
+	const [revision, setRevision] = useState(0)
+	const changed = useCallback(() => setRevision((n) => n + 1), [])
+	const openPlayer = useCallback(
+		(playerId: number) => navigate(`/moderation/players/${playerId}`),
+		[navigate]
+	)
+	const openBan = useCallback(
+		(report: ReportRow) => navigate(`/moderation/reports/${report.id}/ban`),
+		[navigate]
+	)
+	const openReport = useCallback(
+		(report: ReportRow) => navigate(`/moderation/reports/${report.id}`),
+		[navigate]
+	)
+
+	if (account === undefined) {
+		return (
+			<main className="shell wide">
+				<section className="card">
+					<p className="muted">Checking your session…</p>
+				</section>
+			</main>
+		)
+	}
+
+	if (account === null) {
+		return (
+			<main className="shell">
+				<section className="card">
+					<h1>Moderation</h1>
+					<p className="muted">You need to be signed in to use the moderation tools.</p>
+					<button onClick={() => navigate('/login')}>Sign in</button>
+				</section>
+			</main>
+		)
+	}
+
+	// A signed-in player who isn't staff. Told plainly rather than shown a sign-in form:
+	// signing in again would change nothing, and a 404 would just make them wonder.
+	if (!isAdmin()) {
+		return (
+			<main className="shell">
+				<section className="card">
+					<h1>Moderation</h1>
+					<p className="muted">
+						This area is for moderators. Your account doesn&apos;t have the moderator or developer
+						role.
+					</p>
+					<button onClick={() => navigate('/')}>Back to the homepage</button>
+				</section>
+			</main>
+		)
+	}
+
+	return (
+		<main className="shell mod">
+			<section className="card identity">
+				<div className="muted">Moderating as</div>
+				<div className="big">@{account.username}</div>
+				<div className="handle">
+					#{account.accountId} · actions you take here are recorded against this account
+				</div>
+			</section>
+
+			{view.kind === 'player' ? (
+				<PlayerHistory
+					playerId={view.playerId}
+					revision={revision}
+					navigate={navigate}
+					onBan={openBan}
+				/>
+			) : view.kind === 'ban' ? (
+				<BanDialog reportId={view.reportId} navigate={navigate} />
+			) : view.kind === 'report' ? (
+				<ReportDetail reportId={view.reportId} navigate={navigate} onBan={openBan} />
+			) : (
+				<div className="workspace">
+					<nav className="vtabs">
+						{TABS.map((t) => (
+							<button
+								key={t.id}
+								className={t.id === view.tab ? 'active' : ''}
+								onClick={() => navigate(tabPath(t.id))}
+							>
+								{t.label}
+							</button>
+						))}
+					</nav>
+					<div className="panel">
+						{view.tab === 'queue' ? (
+							<ReportQueue
+								search={search}
+								revision={revision}
+								navigate={navigate}
+								onOpenPlayer={openPlayer}
+							/>
+						) : view.tab === 'search' ? (
+							<ReportSearch
+								search={search}
+								revision={revision}
+								navigate={navigate}
+								onOpenPlayer={openPlayer}
+								onBan={openBan}
+								onView={openReport}
+								onChanged={changed}
+							/>
+						) : view.tab === 'bans' ? (
+							<StandingBans revision={revision} onOpenPlayer={openPlayer} onChanged={changed} />
+						) : (
+							// Filing a report navigates straight to the ban dialog for it — filing one
+							// is almost always the first half of banning somebody, and the new report's
+							// id is then in the URL, so the ban is a real page rather than a modal that
+							// a reload would lose.
+							// `?player=` pre-fills who it's against — the Report link on a player's
+							// profile page lands here with it.
+							<FileReport
+								selfId={account.accountId}
+								initialPlayer={new URLSearchParams(search).get('player') ?? ''}
+								onFiled={openBan}
+							/>
+						)}
+					</div>
+				</div>
+			)}
+		</main>
+	)
+}
+
+/**
+ * Back out of a drill-down — the in-page counterpart of the browser's own back button,
+ * and deliberately the SAME action, so the two can't disagree about where "back" is.
+ *
+ * Falls forward to the panel's front page when there is no history to pop: a moderator who
+ * arrived on a pasted link has nothing behind them, and a button that did nothing would
+ * read as broken.
+ */
+function BackLink({ navigate, label }: { navigate: (to: string) => void; label: string }) {
+	return (
+		<button
+			className="linkish"
+			onClick={() => {
+				if (window.history.length > 1) window.history.back()
+				else navigate('/moderation')
+			}}
+		>
+			← {label}
+		</button>
+	)
+}
+
+/**
+ * The report queue: who has collected the most reports lately.
+ *
+ * Ranked by DISTINCT reporters ahead of raw count (see `getTopReported`), because one
+ * player filing twenty reports against someone they're feuding with is a different thing
+ * from twenty players each filing one. The window defaults to 30 days so the list is who
+ * is a problem now rather than whoever has ever accumulated the most.
+ */
+function ReportQueue({
+	search,
+	revision,
+	navigate,
+	onOpenPlayer,
+}: {
+	search: string
+	revision: number
+	navigate: (to: string) => void
+	onOpenPlayer: (id: number) => void
+}) {
+	// In the URL for the same reason the search's filters are: a moderator who widens the
+	// window to 90 days, opens a player and presses Back must come back to the 90 days
+	// they were reading, not to a list quietly reset to the default.
+	const params = new URLSearchParams(search)
+	const sinceDays = params.get('sinceDays') ?? '30'
+	const minReports = params.get('minReports') ?? '3'
+	const queueUrl = (next: { sinceDays?: string; minReports?: string }) => {
+		const updated = new URLSearchParams({ sinceDays, minReports, ...next })
+		return `/moderation?${updated.toString()}`
+	}
+
+	const { data, error } = useStaffData<ReportedPlayerTally[]>(
+		`/api/staff/reports/top-reported?sinceDays=${encodeURIComponent(sinceDays)}&minReports=${encodeURIComponent(minReports)}`,
+		[revision]
+	)
+	const names = useNames((data ?? []).map((row) => row.playerId))
+
+	return (
+		<section className="card">
+			<h2>Report queue</h2>
+			<p className="muted">
+				Players with the most reports against them, ranked by how many different people reported
+				them. Already-banned players are marked but still listed — a ban that is about to expire is
+				worth seeing.
+			</p>
+			<div className="mod-filters">
+				<label>
+					Window
+					<select
+						value={sinceDays}
+						onChange={(e) => navigate(queueUrl({ sinceDays: e.target.value }))}
+					>
+						<option value="1">Last day</option>
+						<option value="7">Last 7 days</option>
+						<option value="30">Last 30 days</option>
+						<option value="90">Last 90 days</option>
+						{/* The server reads 0 as "no window" — see the handler. */}
+						<option value="0">All time</option>
+					</select>
+				</label>
+				<label>
+					Minimum reports
+					{/* A select rather than a number box: each change is now a navigation, and a
+					    free-text field would push a history entry per digit typed — which would
+					    make the back button useless again, the thing this page is fixing. A
+					    threshold is coarse anyway; nobody needs to ask for seven. */}
+					<select
+						value={minReports}
+						onChange={(e) => navigate(queueUrl({ minReports: e.target.value }))}
+					>
+						<option value="1">1 or more</option>
+						<option value="2">2 or more</option>
+						<option value="3">3 or more</option>
+						<option value="5">5 or more</option>
+						<option value="10">10 or more</option>
+					</select>
+				</label>
+			</div>
+
+			{error && <p className="error">{error}</p>}
+			{data === null ? (
+				!error && <p className="muted">Loading…</p>
+			) : data.length === 0 ? (
+				<p className="muted">Nobody has been reported that many times in this window.</p>
+			) : (
+				<div className="mod-scroll">
+					<table className="mod-table">
+						<thead>
+							<tr>
+								<th>Player</th>
+								<th>Reports</th>
+								<th>Reporters</th>
+								<th>Last reported</th>
+								<th />
+							</tr>
+						</thead>
+						<tbody>
+							{data.map((row) => (
+								<tr key={row.playerId}>
+									<td>
+										<PlayerName id={row.playerId} names={names} />
+										{row.bannedNow && <span className="badge mod-banned">Banned</span>}
+									</td>
+									<td>{row.reports}</td>
+									<td>{row.distinctReporters}</td>
+									<td>{when(row.lastReportAt)}</td>
+									<td>
+										<button className="linkish" onClick={() => onOpenPlayer(row.playerId)}>
+											History
+										</button>
+									</td>
+								</tr>
+							))}
+						</tbody>
+					</table>
+				</div>
+			)}
+		</section>
+	)
+}
+
+/**
+ * The search form's state. These are the SAME names the staff endpoint reads as query
+ * params (`searchReportsHandler`) and the same ones the panel's own URL carries, so the
+ * form, the address bar and the request can't drift apart — one spelling throughout.
+ *
+ * `from`/`to` are the `YYYY-MM-DD` a date input gives, converted to instants only when the
+ * request goes out; keeping the URL in the input's own format is what lets a bookmarked
+ * search repopulate the boxes exactly as they were typed.
+ *
+ * `sinceDays` is the quick window — "the last day" — kept as a day count (the queue's
+ * spelling) rather than resolved to a date, so a bookmarked "last day" search is still the
+ * last day when it is opened tomorrow. It and the typed dates are exclusive: picking one
+ * clears the other, so the URL never says two different things about the window.
+ */
+interface SearchFilters {
+	reportedPlayerId: string
+	reporterPlayerId: string
+	reportCategory: string
+	kind: string
+	banned: string
+	sinceDays: string
+	from: string
+	to: string
+}
+
+const QUICK_WINDOWS: Array<{ label: string; days: string }> = [
+	{ label: 'Any time', days: '' },
+	{ label: 'Last day', days: '1' },
+	{ label: 'Last 7 days', days: '7' },
+	{ label: 'Last 30 days', days: '30' },
+	{ label: 'Last 90 days', days: '90' },
+]
+
+const EMPTY_FILTERS: SearchFilters = {
+	reportedPlayerId: '',
+	reporterPlayerId: '',
+	reportCategory: '',
+	kind: '',
+	banned: '',
+	sinceDays: '',
+	from: '',
+	to: '',
+}
+
+/** Read the filters back out of the panel's URL. Absent keys read as empty. */
+function filtersFromSearch(search: string): SearchFilters {
+	const params = new URLSearchParams(search)
+	const read = (key: keyof SearchFilters) => params.get(key) ?? ''
+	return {
+		reportedPlayerId: read('reportedPlayerId'),
+		reporterPlayerId: read('reporterPlayerId'),
+		reportCategory: read('reportCategory'),
+		kind: read('kind'),
+		banned: read('banned'),
+		sinceDays: read('sinceDays'),
+		from: read('from'),
+		to: read('to'),
+	}
+}
+
+/**
+ * The panel URL for a set of filters and a page. Empty values are left OUT rather than
+ * written as blanks, so an unfiltered search is the bare `/moderation/search` and the
+ * address bar says only what was actually asked for.
+ */
+function searchUrl(filters: SearchFilters, skip: number): string {
+	const params = new URLSearchParams()
+	for (const [key, value] of Object.entries(filters)) {
+		if (value !== '') params.set(key, value)
+	}
+	if (skip > 0) params.set('skip', String(skip))
+	const query = params.toString()
+	return query === '' ? '/moderation/search' : `/moderation/search?${query}`
+}
+
+/**
+ * Search the report log.
+ *
+ * The filters and the page live in the URL, not in component state: a moderator searches,
+ * opens a player, and presses Back — and has to land on the results they were reading,
+ * not on an empty form. It also makes a search linkable, which is how one moderator hands
+ * another a slice of the log to look at.
+ *
+ * The two player boxes take either an id or an `@username`, resolved through `accounts`'
+ * search before the query goes out — a moderator following up a Discord report has a name,
+ * not a number, and making them look it up elsewhere first is the kind of friction that
+ * ends in nobody using the panel. The URL holds the resolved ID, since that is what was
+ * searched and what makes the link reproducible.
+ */
+function ReportSearch({
+	search,
+	revision,
+	navigate,
+	onOpenPlayer,
+	onBan,
+	onView,
+	onChanged,
+}: {
+	search: string
+	revision: number
+	navigate: (to: string) => void
+	onOpenPlayer: (id: number) => void
+	onBan: (report: ReportRow) => void
+	onView: (report: ReportRow) => void
+	onChanged: () => void
+}) {
+	const applied = filtersFromSearch(search)
+	const skip = Number.parseInt(new URLSearchParams(search).get('skip') ?? '0', 10) || 0
+	// What is TYPED, which runs ahead of what is applied — a search happens on submit, not
+	// on every keystroke. Keyed on the URL so that arriving at a different search (a link,
+	// or the back button) resets the boxes to it instead of stranding the last thing typed.
+	const [form, setForm] = useState<SearchFilters>(applied)
+	const [formKey, setFormKey] = useState(search)
+	if (formKey !== search) {
+		setFormKey(search)
+		setForm(applied)
+	}
+	const { pending, error: formError, run } = useAction()
+
+	const params = new URLSearchParams({ take: String(PAGE_SIZE), skip: String(skip) })
+	if (applied.reportedPlayerId !== '') params.set('reportedPlayerId', applied.reportedPlayerId)
+	if (applied.reporterPlayerId !== '') params.set('reporterPlayerId', applied.reporterPlayerId)
+	if (applied.reportCategory !== '') params.set('reportCategory', applied.reportCategory)
+	if (applied.kind !== '') params.set('kind', applied.kind)
+	if (applied.banned !== '') params.set('banned', applied.banned)
+	// The quick window is a rolling span back from now — "the last day" is the last 24
+	// hours, not since midnight, which is what a moderator checking in on a player means.
+	const sinceDays = Number.parseInt(applied.sinceDays, 10)
+	if (sinceDays > 0) {
+		params.set('from', new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString())
+	}
+	// A date input gives a bare `YYYY-MM-DD`, so the window is sent as local midnights,
+	// which is what the moderator meant by it. `to` is EXCLUSIVE on the server, so the day
+	// typed there is included only by pushing the bound to the next midnight.
+	if (applied.from !== '') params.set('from', new Date(applied.from).toISOString())
+	if (applied.to !== '') {
+		const to = new Date(applied.to)
+		to.setDate(to.getDate() + 1)
+		params.set('to', to.toISOString())
+	}
+
+	const { data, error } = useStaffData<{ reports: ReportRow[]; total: number }>(
+		`/api/staff/reports?${params.toString()}`,
+		[revision]
+	)
+	const reports = data?.reports ?? []
+	const names = useNames(
+		reports.flatMap((r) => [
+			r.reported_player_id,
+			r.reporter_player_id,
+			r.unbanned_by_player_id ?? 0,
+		])
+	)
+
+	const submit = (e: React.FormEvent) => {
+		e.preventDefault()
+		void run(async () => {
+			// Either box may hold a name; resolve before navigating so the URL carries the id,
+			// as the report rows do.
+			const resolved: SearchFilters = {
+				...form,
+				reportedPlayerId:
+					form.reportedPlayerId.trim() === ''
+						? ''
+						: String(await playerIdFrom(form.reportedPlayerId)),
+				reporterPlayerId:
+					form.reporterPlayerId.trim() === ''
+						? ''
+						: String(await playerIdFrom(form.reporterPlayerId)),
+			}
+			// Back to page one: the new filters have their own result set, and staying on
+			// page three of it would usually show nothing.
+			navigate(searchUrl(resolved, 0))
+			return ''
+		})
+	}
+
+	const total = data?.total ?? 0
+
+	return (
+		<section className="card">
+			<h2>Search reports</h2>
+			<p className="muted">
+				Every report ever filed, newest first. The player boxes take an id or an @username.
+			</p>
+			<form className="mod-filters" onSubmit={submit}>
+				<label>
+					Reported player
+					<input
+						value={form.reportedPlayerId}
+						placeholder="@name or id"
+						onChange={(e) => setForm({ ...form, reportedPlayerId: e.target.value })}
+					/>
+				</label>
+				<label>
+					Reported by
+					<input
+						value={form.reporterPlayerId}
+						placeholder="@name or id"
+						onChange={(e) => setForm({ ...form, reporterPlayerId: e.target.value })}
+					/>
+				</label>
+				<label>
+					Category
+					<select
+						value={form.reportCategory}
+						onChange={(e) => setForm({ ...form, reportCategory: e.target.value })}
+					>
+						<option value="">Any</option>
+						{Object.entries(CATEGORY_LABEL).map(([id, label]) => (
+							<option key={id} value={id}>
+								{label}
+							</option>
+						))}
+					</select>
+				</label>
+				<label>
+					Kind
+					<select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value })}>
+						<option value="">Any</option>
+						{Object.entries(KIND_LABEL).map(([id, label]) => (
+							<option key={id} value={id}>
+								{label}
+							</option>
+						))}
+					</select>
+				</label>
+				<label>
+					Ban state
+					<select
+						value={form.banned}
+						onChange={(e) => setForm({ ...form, banned: e.target.value })}
+					>
+						<option value="">Any</option>
+						<option value="true">Actioned (banned)</option>
+						<option value="false">Not actioned</option>
+					</select>
+				</label>
+				<label>
+					Within
+					<select
+						value={form.sinceDays}
+						onChange={(e) => setForm({ ...form, sinceDays: e.target.value, from: '', to: '' })}
+					>
+						{QUICK_WINDOWS.map((w) => (
+							<option key={w.days} value={w.days}>
+								{w.label}
+							</option>
+						))}
+					</select>
+				</label>
+				<label>
+					From
+					<input
+						type="date"
+						value={form.from}
+						onChange={(e) => setForm({ ...form, sinceDays: '', from: e.target.value })}
+					/>
+				</label>
+				<label>
+					To
+					<input
+						type="date"
+						value={form.to}
+						onChange={(e) => setForm({ ...form, sinceDays: '', to: e.target.value })}
+					/>
+				</label>
+				<div className="mod-filter-actions">
+					<button type="submit" disabled={pending}>
+						{pending ? 'Searching…' : 'Search'}
+					</button>
+					{/* Clearing is a navigation like any other search, so it goes in the history
+					    too — Back after a mis-click returns to what was being read. */}
+					<button
+						type="button"
+						className="linkish"
+						onClick={() => navigate(searchUrl(EMPTY_FILTERS, 0))}
+					>
+						Clear
+					</button>
+				</div>
+			</form>
+
+			{formError && <p className="error">{formError}</p>}
+			{error && <p className="error">{error}</p>}
+
+			{data === null ? (
+				!error && <p className="muted">Loading…</p>
+			) : reports.length === 0 ? (
+				<p className="muted">No reports match those filters.</p>
+			) : (
+				<>
+					<ReportTable
+						reports={reports}
+						names={names}
+						onOpenPlayer={onOpenPlayer}
+						onBan={onBan}
+						onView={onView}
+						onChanged={onChanged}
+					/>
+					{/* Paging is navigation, so each page is its own history entry: Back walks
+					    back through the pages a moderator read rather than out of the panel. */}
+					<div className="mod-pager">
+						<button
+							disabled={skip === 0}
+							onClick={() => navigate(searchUrl(applied, Math.max(skip - PAGE_SIZE, 0)))}
+						>
+							Previous
+						</button>
+						<span className="muted">
+							{skip + 1}–{Math.min(skip + PAGE_SIZE, total)} of {total}
+						</span>
+						<button
+							disabled={skip + PAGE_SIZE >= total}
+							onClick={() => navigate(searchUrl(applied, skip + PAGE_SIZE))}
+						>
+							Next
+						</button>
+					</div>
+				</>
+			)}
+		</section>
+	)
+}
+
+/** An id typed as a number, or an `@username` resolved through `accounts`. */
+async function playerIdFrom(input: string): Promise<number> {
+	const trimmed = input.trim()
+	if (/^\d+$/.test(trimmed)) return Number.parseInt(trimmed, 10)
+	return accountIdForUsername(trimmed)
+}
+
+/** The report rows themselves — shared by the search and the player history. */
+function ReportTable({
+	reports,
+	names,
+	onOpenPlayer,
+	onBan,
+	onView,
+	onChanged,
+	navigate,
+}: {
+	reports: ReportRow[]
+	names: Map<number, PublicAccount>
+	onOpenPlayer?: (id: number) => void
+	onBan: (report: ReportRow) => void
+	/** Opens the report's own page, where the details are rendered whole. */
+	onView: (report: ReportRow) => void
+	onChanged: () => void
+	/** Links each name to its profile — where the table isn't already opening players. */
+	navigate?: (to: string) => void
+}) {
+	return (
+		<div className="mod-scroll">
+			<table className="mod-table">
+				<thead>
+					<tr>
+						<th>#</th>
+						<th>Filed</th>
+						<th>Against</th>
+						<th>By</th>
+						<th>Kind</th>
+						<th>Category</th>
+						<th>Details</th>
+						<th>Ban</th>
+						<th />
+					</tr>
+				</thead>
+				<tbody>
+					{reports.map((report) => (
+						<tr key={report.id}>
+							<td>{report.id}</td>
+							<td title={when(report.created_at)}>{day(report.created_at)}</td>
+							<td>
+								{onOpenPlayer ? (
+									<button
+										className="linkish"
+										onClick={() => onOpenPlayer(report.reported_player_id)}
+									>
+										<PlayerName id={report.reported_player_id} names={names} />
+									</button>
+								) : (
+									<PlayerName id={report.reported_player_id} names={names} navigate={navigate} />
+								)}
+							</td>
+							<td>
+								<PlayerName id={report.reporter_player_id} names={names} navigate={navigate} />
+							</td>
+							<td>
+								<ReportKind report={report} />
+							</td>
+							<td>{categoryLabel(report.report_category)}</td>
+							{/* The reporter's own words, cut to DETAILS_PREVIEW characters; the
+							    report's page renders them whole, as markdown. */}
+							<td className="mod-details">
+								<DetailsPreview report={report} onView={onView} />
+							</td>
+							<td>
+								{report.banned === 1 ? (
+									<span className="badge mod-banned">{expiryLabel(report)}</span>
+								) : banLifted(report) ? (
+									<LiftedBan report={report} names={names} />
+								) : (
+									<span className="muted">—</span>
+								)}
+							</td>
+							<td className="mod-actions">
+								<button className="linkish" onClick={() => onView(report)}>
+									View
+								</button>
+								{report.banned === 1 ? (
+									<LiftBanButton report={report} onDone={onChanged} />
+								) : (
+									<>
+										<button className="linkish accent" onClick={() => onBan(report)}>
+											{banLifted(report) ? 'Ban again' : 'Ban'}
+										</button>
+										{/* Not offered while a ban sits on the row: the ban lives on the
+										    report, so the server refuses until it is lifted. */}
+										<DeleteReportButton report={report} onDone={onChanged} />
+									</>
+								)}
+							</td>
+						</tr>
+					))}
+				</tbody>
+			</table>
+		</div>
+	)
+}
+
+/** How much of a report's details the tables show before "more". */
+const DETAILS_PREVIEW = 200
+
+/**
+ * A report's details as the tables show them: the raw text, cut to {@link DETAILS_PREVIEW}
+ * characters with a "more" link to the report's page. Raw rather than rendered — markdown
+ * cut mid-way renders as broken markup, and the page is where it is read properly.
+ */
+function DetailsPreview({
+	report,
+	onView,
+}: {
+	report: ReportRow
+	onView: (report: ReportRow) => void
+}) {
+	if (!report.details) return <span className="muted">none given</span>
+	// By code point, so an emoji at the cut isn't split into a broken half.
+	const chars = Array.from(report.details)
+	if (chars.length <= DETAILS_PREVIEW) return <>{report.details}</>
+	return (
+		<>
+			{chars.slice(0, DETAILS_PREVIEW).join('').trimEnd()}…{' '}
+			<button className="linkish" onClick={() => onView(report)}>
+				more
+			</button>
+		</>
+	)
+}
+
+/**
+ * A report's details rendered as markdown — only ever the AI moderation bot's (see
+ * `details_markdown`).
+ *
+ * The text is a PLAYER's, shown to staff, so it is rendered without raw HTML (react-markdown
+ * builds React elements and never injects markup; its URL filter drops `javascript:` and the
+ * like). Images are shown as links rather than loaded: loading one would have every
+ * moderator's browser fetch whatever address the reporter chose.
+ */
+function ReportDetails({ details }: { details: string }) {
+	return (
+		<div className="mod-markdown">
+			<Markdown
+				remarkPlugins={[remarkGfm]}
+				components={{
+					a: ({ href, children }) => (
+						<a href={href} target="_blank" rel="noreferrer noopener">
+							{children}
+						</a>
+					),
+					img: ({ src, alt }) =>
+						typeof src === 'string' && src !== '' ? (
+							<a href={src} target="_blank" rel="noreferrer noopener">
+								[image{alt ? `: ${alt}` : ''}]
+							</a>
+						) : (
+							<>[image{alt ? `: ${alt}` : ''}]</>
+						),
+				}}
+			>
+				{details}
+			</Markdown>
+		</div>
+	)
+}
+
+/**
+ * One report on its own page (`/moderation/reports/:id`): everything on the row, with the
+ * details rendered as markdown, and the same actions the tables offer. Read from the
+ * server rather than handed down, so the URL can be pasted to a colleague.
+ */
+function ReportDetail({
+	reportId,
+	navigate,
+	onBan,
+}: {
+	reportId: number
+	navigate: (to: string) => void
+	onBan: (report: ReportRow) => void
+}) {
+	const [revision, setRevision] = useState(0)
+	const { data: report, error } = useStaffData<ReportRow>(`/api/staff/reports/${reportId}`, [
+		revision,
+	])
+	const names = useNames(
+		report
+			? [
+					report.reported_player_id,
+					report.reporter_player_id,
+					report.banned_by_player_id ?? 0,
+					report.unbanned_by_player_id ?? 0,
+				]
+			: []
+	)
+
+	if (error !== '') {
+		return (
+			<section className="card">
+				<BackLink navigate={navigate} label="Back to the tables" />
+				<p className="error">{error}</p>
+			</section>
+		)
+	}
+	if (report === null) {
+		return (
+			<section className="card">
+				<p className="muted">Loading report #{reportId}…</p>
+			</section>
+		)
+	}
+
+	const openPlayer = (id: number) => navigate(`/moderation/players/${id}`)
+	return (
+		<section className="card">
+			<BackLink navigate={navigate} label="Back to the tables" />
+			<h2>Report #{report.id}</h2>
+			<dl className="mod-report-facts">
+				<dt>Against</dt>
+				<dd>
+					<button className="linkish" onClick={() => openPlayer(report.reported_player_id)}>
+						<PlayerName id={report.reported_player_id} names={names} />
+					</button>
+				</dd>
+				<dt>By</dt>
+				<dd>
+					<button className="linkish" onClick={() => openPlayer(report.reporter_player_id)}>
+						<PlayerName id={report.reporter_player_id} names={names} />
+					</button>
+				</dd>
+				<dt>Filed</dt>
+				<dd>{when(report.created_at)}</dd>
+				<dt>Kind</dt>
+				<dd>
+					<ReportKind report={report} />
+				</dd>
+				<dt>Category</dt>
+				<dd>{categoryLabel(report.report_category)}</dd>
+				{report.room_id !== null && (
+					<>
+						<dt>Room</dt>
+						<dd>
+							#{report.room_id}
+							{report.room_instance_type ? ` (${report.room_instance_type})` : ''}
+						</dd>
+					</>
+				)}
+				<dt>Ban</dt>
+				<dd>
+					{report.banned === 1 ? (
+						<span className="badge mod-banned">{expiryLabel(report)}</span>
+					) : banLifted(report) ? (
+						<LiftedBan report={report} names={names} navigate={navigate} />
+					) : (
+						<span className="muted">None</span>
+					)}
+				</dd>
+			</dl>
+
+			<h3>Details</h3>
+			{/* Markdown only for the AI moderation bot's reports; a player's details are plain
+			    text, and rendering them as markdown would mangle a stray `*` or `#`. */}
+			{report.details && report.details_markdown ? (
+				<ReportDetails details={report.details} />
+			) : report.details ? (
+				<p className="mod-plain-details">{report.details}</p>
+			) : (
+				<p className="muted">None given.</p>
+			)}
+
+			<div className="mod-filter-actions">
+				{report.banned === 1 ? (
+					<LiftBanButton report={report} onDone={() => setRevision((n) => n + 1)} />
+				) : (
+					<>
+						<button type="button" className="primary" onClick={() => onBan(report)}>
+							{banLifted(report) ? 'Ban again' : 'Ban'}
+						</button>
+						{/* Deleted, the page has nothing left to show, so it goes to the player. */}
+						<DeleteReportButton
+							report={report}
+							onDone={() => navigate(`/moderation/players/${report.reported_player_id}`)}
+						/>
+					</>
+				)}
+			</div>
+		</section>
+	)
+}
+
+/**
+ * Lift the ban on a report. Confirmed first — it is one click next to a row of them, and
+ * the mistake puts a banned player straight back in the game.
+ */
+function LiftBanButton({ report, onDone }: { report: ReportRow; onDone: () => void }) {
+	const { pending, error, run } = useAction()
+	return (
+		<>
+			<button
+				className="linkish"
+				disabled={pending}
+				onClick={() =>
+					void run(async () => {
+						if (!confirm(`Lift the ban on player #${report.reported_player_id}?`)) return ''
+						await call(`/api/staff/reports/${report.id}/ban`, {
+							authed: true,
+							json: { banned: false },
+						})
+						onDone()
+						return ''
+					})
+				}
+			>
+				{pending ? 'Lifting…' : 'Lift ban'}
+			</button>
+			{error && <p className="error">{error}</p>}
+		</>
+	)
+}
+
+/**
+ * Delete a frivolous report. Confirmed first, like the lift beside it — it is one click in a
+ * row of them, and the report doesn't come back without digging it out of the audit log.
+ */
+function DeleteReportButton({ report, onDone }: { report: ReportRow; onDone: () => void }) {
+	const { pending, error, run } = useAction()
+	return (
+		<>
+			<button
+				className="linkish danger"
+				disabled={pending}
+				onClick={() =>
+					void run(async () => {
+						if (!confirm(`Delete report #${report.id}? This can't be undone from here.`)) return ''
+						await call(`/api/staff/reports/${report.id}`, { method: 'DELETE', authed: true })
+						onDone()
+						return ''
+					})
+				}
+			>
+				{pending ? 'Deleting…' : 'Delete'}
+			</button>
+			{error && <p className="error">{error}</p>}
+		</>
+	)
+}
+
+/** Every ban in force right now. */
+function StandingBans({
+	revision,
+	onOpenPlayer,
+	onChanged,
+}: {
+	revision: number
+	onOpenPlayer: (id: number) => void
+	onChanged: () => void
+}) {
+	const { data, error } = useStaffData<ReportRow[]>('/api/staff/bans', [revision])
+	const bans = data ?? []
+	const names = useNames(bans.flatMap((b) => [b.reported_player_id, b.banned_by_player_id ?? 0]))
+
+	return (
+		<section className="card">
+			<h2>Standing bans</h2>
+			<p className="muted">
+				Bans in force right now, most recent first — so a ban handed down by mistake is at the top,
+				where you would go looking for it. An expired ban isn&apos;t here: it has served its time,
+				and the report stays as the record that it happened.
+			</p>
+			{error && <p className="error">{error}</p>}
+			{data === null ? (
+				!error && <p className="muted">Loading…</p>
+			) : bans.length === 0 ? (
+				<p className="muted">Nobody is banned.</p>
+			) : (
+				<div className="mod-scroll">
+					<table className="mod-table">
+						<thead>
+							<tr>
+								<th>Player</th>
+								<th>Report</th>
+								<th>Reason</th>
+								<th>Banned</th>
+								<th>By</th>
+								<th>Lifts</th>
+								<th />
+							</tr>
+						</thead>
+						<tbody>
+							{bans.map((ban) => (
+								<tr key={ban.id}>
+									<td>
+										<button
+											className="linkish"
+											onClick={() => onOpenPlayer(ban.reported_player_id)}
+										>
+											<PlayerName id={ban.reported_player_id} names={names} />
+										</button>
+									</td>
+									<td>#{ban.id}</td>
+									<td>{categoryLabel(ban.report_category)}</td>
+									{/* `banned_at` where there is one; a ban handed down before that
+									    column existed has only the report's own date to show. */}
+									<td>
+										{ban.banned_at === null ? (
+											<span className="muted" title="Recorded before ban timestamps were kept">
+												{when(ban.created_at)}?
+											</span>
+										) : (
+											when(ban.banned_at)
+										)}
+									</td>
+									<td>
+										{ban.banned_by_player_id === null ? (
+											<span className="muted">unknown</span>
+										) : (
+											<PlayerName id={ban.banned_by_player_id} names={names} />
+										)}
+									</td>
+									<td>{ban.ban_expires === null ? 'Never' : when(ban.ban_expires)}</td>
+									<td>
+										<LiftBanButton report={ban} onDone={onChanged} />
+									</td>
+								</tr>
+							))}
+						</tbody>
+					</table>
+				</div>
+			)}
+		</section>
+	)
+}
+
+/**
+ * Everything on file about one player: the reports against them, the warnings handed
+ * down, the ban in force, and who else a ban would reach.
+ *
+ * One screen because it is one decision. A moderator about to ban someone wants the
+ * history and the blast radius in front of them, not in three places.
+ */
+function PlayerHistory({
+	playerId,
+	revision,
+	navigate,
+	onBan,
+}: {
+	playerId: number
+	revision: number
+	navigate: (to: string) => void
+	onBan: (report: ReportRow) => void
+}) {
+	// Bumped by a write that leaves you on this page — lifting a ban from the table below.
+	const [ownRevision, setOwnRevision] = useState(0)
+	const { data, error } = useStaffData<PlayerHistoryData>(`/api/staff/players/${playerId}`, [
+		revision,
+		ownRevision,
+	])
+	const reports = data?.reports ?? []
+	const warnings = data?.warnings ?? []
+	const names = useNames([
+		playerId,
+		...reports.map((r) => r.reporter_player_id),
+		...reports.map((r) => r.unbanned_by_player_id ?? 0),
+		...warnings.map((w) => w.moderator_player_id),
+		data?.blockedBy?.bannedAccountId ?? 0,
+	])
+	// The most recent lift, if any — it is the thing a moderator about to ban needs to know
+	// first, since the report rows below say "Ban again" and the reason is up here.
+	const lastLifted = reports
+		.filter(banLifted)
+		.sort((a, b) => (a.unbanned_at! < b.unbanned_at! ? 1 : -1))[0]
+
+	return (
+		<>
+			<section className="card">
+				<BackLink navigate={navigate} label="Back to the tables" />
+				<h2>
+					<PlayerName id={playerId} names={names} navigate={navigate} />
+				</h2>
+				{error && <p className="error">{error}</p>}
+				{data === null ? (
+					!error && <p className="muted">Loading…</p>
+				) : data.activeBan === null ? (
+					<>
+						{data.blockedBy !== null && (
+							<p className="error">
+								<BanSummary data={data} names={names} navigate={navigate} />
+							</p>
+						)}
+						<p className="muted">
+							{data.blockedBy === null ? 'Not banned.' : 'No ban on this account itself.'}{' '}
+							{reports.length} report{reports.length === 1 ? '' : 's'} on file, {warnings.length}{' '}
+							warning{warnings.length === 1 ? '' : 's'} handed down.
+						</p>
+						{lastLifted !== undefined && (
+							<p className="mod-lifted-note">
+								<LiftedBan report={lastLifted} names={names} navigate={navigate} /> — on report #
+								{lastLifted.id} for {categoryLabel(lastLifted.report_category)}. Check with them
+								before banning again.
+							</p>
+						)}
+					</>
+				) : (
+					<p className="ok">
+						<BanSummary data={data} names={names} navigate={navigate} />
+					</p>
+				)}
+			</section>
+
+			<LinkedAccountsPanel playerId={playerId} navigate={navigate} />
+
+			<section className="card">
+				<h2>Reports</h2>
+				{reports.length === 0 ? (
+					<p className="muted">Nobody has reported this player.</p>
+				) : (
+					<ReportTable
+						reports={reports}
+						names={names}
+						onBan={onBan}
+						onView={(report) => navigate(`/moderation/reports/${report.id}`)}
+						onChanged={() => setOwnRevision((n) => n + 1)}
+						navigate={navigate}
+					/>
+				)}
+			</section>
+
+			<section className="card">
+				<h2>Warnings</h2>
+				<p className="muted">
+					Warnings a moderator handed down, from the game&apos;s own warning endpoint. Nothing here
+					dispatches them; the rows are the record.
+				</p>
+				{warnings.length === 0 ? (
+					<p className="muted">No warnings on file.</p>
+				) : (
+					<div className="mod-scroll">
+						<table className="mod-table">
+							<thead>
+								<tr>
+									<th>When</th>
+									<th>By</th>
+									<th>Category</th>
+									<th>Shown to the player</th>
+									<th>Internal note</th>
+								</tr>
+							</thead>
+							<tbody>
+								{warnings.map((warning) => (
+									<tr key={warning.id}>
+										<td>{when(warning.created_at)}</td>
+										<td>
+											<PlayerName
+												id={warning.moderator_player_id}
+												names={names}
+												navigate={navigate}
+											/>
+										</td>
+										<td>{categoryLabel(warning.report_category)}</td>
+										<td>{warning.display_reason ?? <span className="muted">—</span>}</td>
+										<td>{warning.moderator_note ?? <span className="muted">—</span>}</td>
+									</tr>
+								))}
+							</tbody>
+						</table>
+					</div>
+				)}
+			</section>
+		</>
+	)
+}
+
+/**
+ * " · last <date>" for an address's last-seen time, or nothing when there is none to show: a
+ * row backfilled from an account that recorded no login time carries an empty one.
+ */
+function seenOn(iso: string): string {
+	const at = new Date(iso)
+	return Number.isNaN(at.getTime()) ? '' : ` · last ${at.toLocaleDateString()}`
+}
+
+/**
+ * Who ELSE a ban on this player would block.
+ *
+ * The IP arm is coarse by design — households, NAT, campus and carrier networks put
+ * unrelated players behind one address — so a ban can reach people who did nothing. That
+ * trade is the operator's to make, but it should be made with this list in front of them
+ * rather than discovered from a support ticket.
+ */
+function LinkedAccountsPanel({
+	playerId,
+	navigate,
+}: {
+	playerId: number
+	navigate: (to: string) => void
+}) {
+	const { data, error } = useStaffData<{
+		arms: { ip: boolean; platform: boolean }
+		self: LinkedAccount
+		linked: LinkedAccount[]
+	}>(`/api/staff/players/${playerId}/linked`)
+
+	if (error !== '')
+		return (
+			<section className="card">
+				<p className="error">{error}</p>
+			</section>
+		)
+	if (data === null) return null
+
+	const arms = [data.arms.platform && 'shared platform identity', data.arms.ip && 'shared IP']
+		.filter(Boolean)
+		.join(' and ')
+
+	// The addresses this account has used, so a linked row's shared ones can be marked: an
+	// IP match is made on ANY address in either history, and the moderator should see which.
+	const selfIps = new Set(data.self.ips.map((entry) => entry.ip))
+
+	return (
+		<section className="card">
+			<h2>Who a ban would also reach</h2>
+			<p className="muted">
+				{arms === ''
+					? 'Ban-evasion matching is switched off on this server, so a ban reaches exactly the one account.'
+					: data.linked.length === 0
+						? `No other account shares a ${arms} with this one — a ban reaches only them.`
+						: `Evasion matching is on for ${arms}. The accounts below this one would be blocked too:`}
+			</p>
+			<div className="mod-scroll">
+				<table className="mod-table">
+					<thead>
+						<tr>
+							<th>Username</th>
+							<th>Platform</th>
+							<th>Platform ID</th>
+							<th>Signup IP</th>
+							<th>Last login IP</th>
+							<th>All IPs seen</th>
+						</tr>
+					</thead>
+					<tbody>
+						{[data.self, ...data.linked].map((row, i) => (
+							<tr key={row.accountId}>
+								<td>
+									{row.username ? (
+										<ProfileLink username={row.username} navigate={navigate}>
+											@{row.username}
+										</ProfileLink>
+									) : (
+										'unknown'
+									)}
+									<span className="muted"> #{row.accountId}</span>
+									{i === 0 && <span className="badge mod-via">This account</span>}
+									{row.via.includes('platform') && (
+										<span className="badge live mod-via">Same login</span>
+									)}
+									{row.via.includes('ip') && <span className="badge mod-via">Same IP</span>}
+								</td>
+								<td>
+									{row.platforms.length === 0 ? (
+										<span className="muted">—</span>
+									) : (
+										row.platforms.map((p) => (
+											<div key={`${p.platform}-${p.platformId}`}>{platformName(p.platform)}</div>
+										))
+									)}
+								</td>
+								<td>
+									{row.platforms.length === 0 ? (
+										<span className="muted">—</span>
+									) : (
+										row.platforms.map((p) => (
+											<div key={`${p.platform}-${p.platformId}`}>
+												<code>{p.platformId}</code>
+											</div>
+										))
+									)}
+								</td>
+								<td>
+									{row.signupIp ? <code>{row.signupIp}</code> : <span className="muted">—</span>}
+								</td>
+								<td>
+									{row.lastLoginIp ? (
+										<code>{row.lastLoginIp}</code>
+									) : (
+										<span className="muted">—</span>
+									)}
+								</td>
+								<td>
+									{row.ips.length === 0 ? (
+										<span className="muted">—</span>
+									) : (
+										row.ips.map((entry) => (
+											<div key={entry.ip} title={`First seen ${entry.firstSeen}`}>
+												<code>{entry.ip}</code>
+												{i > 0 && selfIps.has(entry.ip) && (
+													<span className="badge mod-via">Shared</span>
+												)}
+												<span className="muted">
+													{' '}
+													{entry.hits}×{seenOn(entry.lastSeen)}
+												</span>
+											</div>
+										))
+									)}
+								</td>
+							</tr>
+						))}
+					</tbody>
+				</table>
+			</div>
+			{data.arms.ip && data.linked.length > 0 && (
+				<p className="muted">
+					An IP match is not proof of the same person. Households and shared networks look identical
+					to it.
+				</p>
+			)}
+		</section>
+	)
+}
+
+/**
+ * File a report by hand.
+ *
+ * A ban lives ON a report (see reports-db), so acting on something nobody happened to
+ * report — found in a log, seen first-hand, escalated from Discord — needs a row to hang
+ * it off. The reporter is the acting moderator, taken from the token; that is the record
+ * of who raised it, which is why nothing marks these rows as staff-created.
+ *
+ * Filed through the game's own report endpoint (`api` `POST /api/PlayerReporting/v3/create`),
+ * so a hand-written report is the same row by the same path as a player's. That endpoint
+ * answers the stored row as `value`, and the new report goes straight to the ban dialog,
+ * since filing one is almost always the first half of banning somebody.
+ */
+function FileReport({
+	selfId,
+	initialPlayer,
+	onFiled,
+}: {
+	selfId: number
+	initialPlayer: string
+	onFiled: (report: ReportRow) => void
+}) {
+	const [player, setPlayer] = useState(initialPlayer)
+	const [category, setCategory] = useState(String(KickReportCategory.Misc))
+	const [details, setDetails] = useState('')
+	const { pending, error, run } = useAction()
+
+	return (
+		<section className="card">
+			<h2>File a report</h2>
+			<p className="muted">
+				For something no player reported. It is filed under your account, and opens the ban dialog
+				once saved — you don&apos;t have to ban, and the row stands on its own either way.
+			</p>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault()
+					void run(async () => {
+						const reportedPlayerId = await playerIdFrom(player)
+						// A mistake every time, and the ban it would justify locks the panel's own
+						// operator out of the game. The game endpoint doesn't refuse it, so this does.
+						if (reportedPlayerId === selfId) {
+							throw new Error('You cannot file a report against yourself')
+						}
+						// No room id: a moderator doesn't know a room's numeric id, so where it
+						// happened goes in the details with the rest of the account.
+						const { value: report } = await call<{ value: ReportRow }>(
+							`${where().api}/api/PlayerReporting/v3/create`,
+							{
+								authed: true,
+								form: {
+									PlayerIdReported: String(reportedPlayerId),
+									ReportCategory: category,
+									...(details.trim() === '' ? {} : { Details: details.trim() }),
+								},
+							}
+						)
+						// Straight to the ban page for the new report, which names it — so no
+						// success line is returned here: this form is gone by the time one could
+						// be read, and the fields don't need clearing for the same reason.
+						onFiled(report)
+						return ''
+					})
+				}}
+			>
+				<label>
+					Player
+					<input
+						value={player}
+						placeholder="@name or id"
+						required
+						onChange={(e) => setPlayer(e.target.value)}
+					/>
+				</label>
+				<label>
+					Category
+					<select value={category} onChange={(e) => setCategory(e.target.value)}>
+						{FILEABLE_CATEGORIES.map((id) => (
+							<option key={id} value={id}>
+								{categoryLabel(id)}
+							</option>
+						))}
+					</select>
+				</label>
+				<label>
+					What happened
+					<textarea
+						value={details}
+						rows={4}
+						placeholder="What you saw, where you saw it, and anything a second moderator would need. Kept internally."
+						onChange={(e) => setDetails(e.target.value)}
+					/>
+				</label>
+				{error && <p className="error">{error}</p>}
+				<button type="submit" disabled={pending}>
+					{pending ? 'Filing…' : 'File report'}
+				</button>
+			</form>
+		</section>
+	)
+}
+
+/** The ban lengths offered, in the order the dialog lists them. `null` is permanent. */
+const BAN_LENGTHS: Array<{ label: string; days: number | null }> = [
+	{ label: '1 day', days: 1 },
+	{ label: '3 days', days: 3 },
+	{ label: '7 days', days: 7 },
+	{ label: '30 days', days: 30 },
+	{ label: '90 days', days: 90 },
+	{ label: 'Permanent', days: null },
+]
+
+/**
+ * Hand down a ban on one report.
+ *
+ * Takes a LENGTH rather than a date: a moderator decides "7 days", and the server turns
+ * that into the expiry it stores, so nobody is doing calendar arithmetic over a ban. The
+ * evasion preview is shown here too — this is the moment the blast radius matters.
+ *
+ * Says out loud what applying it does beyond the row: the player is thrown out of the
+ * instance they are standing in, which is the part that is not obvious from "ban".
+ */
+function BanDialog({ reportId, navigate }: { reportId: number; navigate: (to: string) => void }) {
+	const [choice, setChoice] = useState('7')
+	const { pending, error, run } = useAction()
+	// The report is READ here rather than handed down as a prop, which is what makes the
+	// URL self-sufficient: a reload, or a pasted `/moderation/reports/12/ban`, opens the
+	// same form instead of a blank page. It is also the report as it stands NOW — if
+	// somebody else banned it while this was being opened, that shows.
+	const { data: report, error: loadError } = useStaffData<ReportRow>(
+		`/api/staff/reports/${reportId}`
+	)
+	const names = useNames(
+		report ? [report.reported_player_id, report.unbanned_by_player_id ?? 0] : []
+	)
+
+	if (loadError !== '') {
+		return (
+			<section className="card">
+				<BackLink navigate={navigate} label="Back to the tables" />
+				<p className="error">{loadError}</p>
+			</section>
+		)
+	}
+	if (report === null) {
+		return (
+			<section className="card">
+				<p className="muted">Loading report #{reportId}…</p>
+			</section>
+		)
+	}
+
+	// Already actioned — reached by a stale link or the back button after banning. Shown
+	// as the standing ban it is rather than as a form that would silently re-ban and
+	// restart the clock.
+	if (report.banned === 1) {
+		return (
+			<section className="card">
+				<BackLink navigate={navigate} label="Back to the tables" />
+				<h2>
+					<PlayerName id={report.reported_player_id} names={names} /> is already banned
+				</h2>
+				<p className="muted">
+					Report #{report.id} — {categoryLabel(report.report_category)}
+					{report.details ? `: “${report.details}”` : ''}
+				</p>
+				<p className="muted">
+					Banned {report.ban_expires === null ? 'permanently' : `until ${when(report.ban_expires)}`}
+					. Lift it from the tables if this was a mistake.
+				</p>
+				<button onClick={() => navigate(`/moderation/players/${report.reported_player_id}`)}>
+					See their history
+				</button>
+			</section>
+		)
+	}
+
+	return (
+		<section className="card mod-dialog">
+			<BackLink navigate={navigate} label="Back to the tables" />
+			<h2>
+				Ban <PlayerName id={report.reported_player_id} names={names} />
+			</h2>
+			<p className="muted">
+				On report #{report.id} — {categoryLabel(report.report_category)}
+				{report.details ? `: “${report.details}”` : ''}
+			</p>
+			{/* The one thing this form must not do quietly: a ban on this very report was
+			    lifted on purpose, and applying another undoes a colleague's decision. The
+			    form still works — sometimes a re-ban IS the decision — but not by accident. */}
+			{banLifted(report) && (
+				<p className="mod-lifted-note">
+					<LiftedBan report={report} names={names} navigate={navigate} />. Banning again overrides
+					that — check with them first unless something new has happened.
+				</p>
+			)}
+
+			<LinkedAccountsPanel playerId={report.reported_player_id} navigate={navigate} />
+
+			<form
+				onSubmit={(e) => {
+					e.preventDefault()
+					void run(async () => {
+						const length = BAN_LENGTHS.find((l) => String(l.days) === choice)
+						await call(`/api/staff/reports/${report.id}/ban`, {
+							authed: true,
+							// `permanent` rather than an absent duration: the server reads "no
+							// duration" as permanent too, but saying it explicitly means a bug in
+							// this form can't quietly hand out a life ban.
+							json:
+								length?.days === null || length === undefined
+									? { banned: true, permanent: true }
+									: { banned: true, days: length.days },
+						})
+						// Onto the player's record rather than back where they came from: it is
+						// the confirmation that the ban landed and the place to lift it from if it
+						// was wrong, and it means Back doesn't return to a spent form.
+						navigate(`/moderation/players/${report.reported_player_id}`)
+						return ''
+					})
+				}}
+			>
+				<label>
+					Length
+					<select value={choice} onChange={(e) => setChoice(e.target.value)}>
+						{BAN_LENGTHS.map((length) => (
+							<option key={length.label} value={String(length.days)}>
+								{length.label}
+							</option>
+						))}
+					</select>
+				</label>
+				<p className="muted">
+					They are thrown out of the room they&apos;re in right now, and refused at matchmaking
+					until the ban lifts. The report stays as the record either way, and a ban can be lifted
+					from the tables.
+				</p>
+				{error && <p className="error">{error}</p>}
+				<div className="mod-filter-actions">
+					<button type="submit" disabled={pending}>
+						{pending ? 'Banning…' : banLifted(report) ? 'Ban again' : 'Apply ban'}
+					</button>
+					<button
+						type="button"
+						className="linkish"
+						onClick={() => {
+							if (window.history.length > 1) window.history.back()
+							else navigate('/moderation')
+						}}
+					>
+						Cancel
+					</button>
+				</div>
+			</form>
+		</section>
+	)
+}
